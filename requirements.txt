@@ -1,0 +1,10 @@
+streamlit
+matplotlib
+groq
+python-dotenv
+SpeechRecognition
+pyttsx3
+PyAudio
+scikit-learn
+numpy
+yfinance
