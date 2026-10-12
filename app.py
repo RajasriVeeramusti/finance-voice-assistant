@@ -5,7 +5,6 @@ import uuid
 from datetime import datetime
 
 import matplotlib.pyplot as plt
-import speech_recognition as sr
 import streamlit as st
 
 from agent import route_query
