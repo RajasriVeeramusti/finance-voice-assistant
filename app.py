@@ -7,10 +7,10 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import streamlit as st
 import hashlib
+import re
 
 from agent import route_query
 from database import load_user_data
-import streamlit.components.v1 as components
 
 
 # -------------------- PAGE CONFIGURATION --------------------
@@ -218,6 +218,39 @@ active_chat = st.session_state.chat_sessions[
 ]
 
 
+# -------------------- RESPONSE FORMATTING --------------------
+
+def render_answer_content(answer):
+    """Render normal text as Markdown and display display-math as real equations."""
+    answer = str(answer or "")
+    # Accept common display-math forms: \[ ... \], $$ ... $$, and
+    # a bracketed expression containing clear LaTeX commands (e.g. \frac).
+    pattern = re.compile(
+        r"\\\[(.*?)\\\]|\$\$(.*?)\$\$|"
+        r"\[\s*(?=[^\]]*(?:\\frac|\\times|\\sqrt|\\sum|\\int|\\cdot|\\div|\\pi|\\text|\^\{)).*?\]",
+        re.DOTALL,
+    )
+    cursor = 0
+    for match in pattern.finditer(answer):
+        before = answer[cursor:match.start()].strip()
+        if before:
+            st.markdown(before)
+
+        formula = next((group for group in match.groups() if group is not None), None)
+        if formula is None:
+            # The third alternative matches bracketed LaTeX without a capture group.
+            formula = match.group(0).strip()[1:-1]
+        formula = formula.strip().strip("$").strip()
+        if formula:
+            st.latex(formula)
+        cursor = match.end()
+
+    remainder = answer[cursor:].strip()
+    if remainder:
+        st.markdown(remainder)
+
+
+
 # -------------------- CHAT INTERFACE --------------------
 
 st.title("💰 Finance Voice AI Assistant")
@@ -228,49 +261,7 @@ for message in active_chat["messages"]:
     avatar = "👤" if message["role"] == "user" else "🤖"
 
     with st.chat_message(message["role"], avatar=avatar):
-        st.markdown(message["content"])
-
-
-# -------------------- BROWSER SPEECH OUTPUT --------------------
-
-def render_browser_speech_controls(answer, auto_speak=True):
-    """Speak in the user's browser and provide a working Stop Speaking button."""
-    safe_answer = json.dumps(str(answer)).replace("<", "\\u003c")
-    auto_speak_js = "true" if auto_speak else "false"
-    html = f"""
-    <div style="font-family:sans-serif;display:flex;align-items:center;gap:10px;">
-      <button id="stop-speech"
-        style="border:1px solid #555;border-radius:8px;padding:9px 13px;
-               background:#20232b;color:white;cursor:pointer;">
-        ⏹️ Stop speaking
-      </button>
-      <span id="speech-status" style="color:#999;font-size:13px;"></span>
-    </div>
-    <script>
-      const answerText = {safe_answer};
-      const shouldSpeak = {auto_speak_js};
-      const status = document.getElementById("speech-status");
-      function stopSpeech() {{
-        window.speechSynthesis.cancel();
-        status.textContent = "Speech stopped.";
-      }}
-      document.getElementById("stop-speech").addEventListener("click", stopSpeech);
-      if (shouldSpeak && answerText && "speechSynthesis" in window) {{
-        window.speechSynthesis.cancel();
-        const utterance = new SpeechSynthesisUtterance(answerText);
-        utterance.lang = "en-IN";
-        utterance.onstart = () => status.textContent = "Speaking answer…";
-        utterance.onend = () => status.textContent = "Finished speaking.";
-        utterance.onerror = () => status.textContent = "Browser speech is unavailable.";
-        window.speechSynthesis.speak(utterance);
-      }} else if (!("speechSynthesis" in window)) {{
-        status.textContent = "Speech output is not supported by this browser.";
-      }} else {{
-        status.textContent = "Spoken answers are turned off.";
-      }}
-    </script>
-    """
-    components.html(html, height=54, scrolling=False)
+        render_answer_content(message["content"])
 
 
 # -------------------- MESSAGE PROCESSING --------------------
@@ -319,7 +310,7 @@ def process_message(user_text):
                 )
                 print(f"Chat processing error: {exc}")
 
-            st.markdown(answer)
+            render_answer_content(answer)
 
     chat["messages"].append({
         "role": "assistant",
@@ -328,20 +319,7 @@ def process_message(user_text):
 
     save_sessions()
 
-    # Browser-based speech works on Streamlit Cloud (unlike server-side TTS).
-    render_browser_speech_controls(
-        answer,
-        auto_speak=st.session_state.get("speak_answers", True),
-    )
-
-
 # -------------------- TEXT INPUT --------------------
-
-st.toggle(
-    "Speak assistant answers aloud",
-    value=True,
-    key="speak_answers",
-)
 
 user_input = st.chat_input(
     "Ask anything about your finances or other topics..."
@@ -409,8 +387,6 @@ if audio_recording is not None:
                 f"Error type: {type(exc).__name__}."
             )
 
-if not st.session_state.get("speak_answers", True):
-    st.caption("🔇 Spoken answers are turned off; answers will still appear as text.")
 
 
 # -------------------- FINANCIAL DASHBOARD --------------------
