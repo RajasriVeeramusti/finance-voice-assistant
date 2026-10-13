@@ -120,9 +120,18 @@ def save_sessions():
 
 
 def create_chat():
-    """Create a blank chat in memory, without saving it to history."""
+    """Create a blank chat and clear the previous chat's browser recorder state."""
+    previous_chat_id = st.session_state.get("active_chat_id")
+
+    # Remove the previous chat's recorder value before its widget is instantiated
+    # again during this run. A chat-specific key gives the new chat a fresh recorder.
+    if previous_chat_id:
+        st.session_state.pop(f"voice_recording_{previous_chat_id}", None)
+        st.session_state.pop(f"last_attempted_audio_digest_{previous_chat_id}", None)
+
     chat_id = str(uuid.uuid4())
 
+    st.session_state["last_attempted_audio_digest_" + chat_id] = None
     st.session_state.chat_sessions[chat_id] = {
         "title": "New chat",
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -338,17 +347,23 @@ st.caption(
 )
 
 # Browser-side recording avoids server microphone/PyAudio problems on Streamlit Cloud.
-audio_recording = st.audio_input("🎙️ Record your question", key="voice_recording")
+# A unique key per chat ensures each new conversation gets an empty recorder.
+active_voice_key = f"voice_recording_{st.session_state.active_chat_id}"
+active_digest_key = f"last_attempted_audio_digest_{st.session_state.active_chat_id}"
+audio_recording = st.audio_input(
+    "🎙️ Record your question",
+    key=active_voice_key,
+)
 
 if audio_recording is not None:
     audio_bytes = audio_recording.getvalue()
     audio_digest = hashlib.sha256(audio_bytes).hexdigest()
-    last_attempted_digest = st.session_state.get("last_attempted_audio_digest")
+    last_attempted_digest = st.session_state.get(active_digest_key)
 
-    # st.audio_input causes reruns; the digest ensures a recording is handled once.
+    # st.audio_input causes reruns; the digest ensures a recording is handled once per chat.
     if audio_bytes and audio_digest != last_attempted_digest:
         # Set before network calls to prevent duplicate submissions during reruns.
-        st.session_state.last_attempted_audio_digest = audio_digest
+        st.session_state[active_digest_key] = audio_digest
 
         try:
             api_key = st.secrets.get("GROQ_API_KEY", "")
