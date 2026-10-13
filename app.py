@@ -6,6 +6,7 @@ from datetime import datetime
 
 import matplotlib.pyplot as plt
 import streamlit as st
+import speech_recognition as sr
 
 from agent import route_query
 from database import load_user_data
