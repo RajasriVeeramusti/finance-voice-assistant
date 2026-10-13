@@ -7,10 +7,10 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import streamlit as st
 import hashlib
-import re
 
 from agent import route_query
 from database import load_user_data
+from voice import speak, stop_speaking, is_speaking
 
 
 # -------------------- PAGE CONFIGURATION --------------------
@@ -156,11 +156,6 @@ with st.sidebar:
     st.caption("Your personal finance chatbot")
 
     if st.button("＋ New Chat", use_container_width=True):
-        # Clear the browser audio widget and its deduplication marker so the
-        # previous recording cannot reappear or be processed in the new chat.
-        st.session_state.pop("voice_recording", None)
-        st.session_state.pop("last_attempted_audio_digest", None)
-        st.session_state.pop("last_transcription", None)
         create_chat()
         st.rerun()
 
@@ -223,39 +218,6 @@ active_chat = st.session_state.chat_sessions[
 ]
 
 
-# -------------------- RESPONSE FORMATTING --------------------
-
-def render_answer_content(answer):
-    """Render normal text as Markdown and display display-math as real equations."""
-    answer = str(answer or "")
-    # Accept common display-math forms: \[ ... \], $$ ... $$, and
-    # a bracketed expression containing clear LaTeX commands (e.g. \frac).
-    pattern = re.compile(
-        r"\\\[(.*?)\\\]|\$\$(.*?)\$\$|"
-        r"\[\s*(?=[^\]]*(?:\\frac|\\times|\\sqrt|\\sum|\\int|\\cdot|\\div|\\pi|\\text|\^\{)).*?\]",
-        re.DOTALL,
-    )
-    cursor = 0
-    for match in pattern.finditer(answer):
-        before = answer[cursor:match.start()].strip()
-        if before:
-            st.markdown(before)
-
-        formula = next((group for group in match.groups() if group is not None), None)
-        if formula is None:
-            # The third alternative matches bracketed LaTeX without a capture group.
-            formula = match.group(0).strip()[1:-1]
-        formula = formula.strip().strip("$").strip()
-        if formula:
-            st.latex(formula)
-        cursor = match.end()
-
-    remainder = answer[cursor:].strip()
-    if remainder:
-        st.markdown(remainder)
-
-
-
 # -------------------- CHAT INTERFACE --------------------
 
 st.title("💰 Finance Voice AI Assistant")
@@ -266,7 +228,7 @@ for message in active_chat["messages"]:
     avatar = "👤" if message["role"] == "user" else "🤖"
 
     with st.chat_message(message["role"], avatar=avatar):
-        render_answer_content(message["content"])
+        st.markdown(message["content"])
 
 
 # -------------------- MESSAGE PROCESSING --------------------
@@ -281,13 +243,11 @@ def process_message(user_text):
     chat_id = st.session_state.active_chat_id
     chat = st.session_state.chat_sessions[chat_id]
 
-    # Add the user message exactly once and display it in this run.
+    # Add the user message exactly once.
     chat["messages"].append({
         "role": "user",
         "content": user_text,
     })
-    with st.chat_message("user", avatar="👤"):
-        st.markdown(user_text)
 
     # Use the first user message as the chat title.
     if chat["title"] == "New chat":
@@ -315,7 +275,7 @@ def process_message(user_text):
                 )
                 print(f"Chat processing error: {exc}")
 
-            render_answer_content(answer)
+            st.markdown(answer)
 
     chat["messages"].append({
         "role": "assistant",
@@ -324,7 +284,21 @@ def process_message(user_text):
 
     save_sessions()
 
+    # Speak the answer if the option is enabled.
+    if st.session_state.get("speak_answers", True):
+        try:
+            speak(answer)
+        except Exception as exc:
+            st.warning(f"Could not play the spoken answer: {exc}")
+
+
 # -------------------- TEXT INPUT --------------------
+
+st.toggle(
+    "Speak assistant answers aloud",
+    value=True,
+    key="speak_answers",
+)
 
 user_input = st.chat_input(
     "Ask anything about your finances or other topics..."
@@ -332,66 +306,84 @@ user_input = st.chat_input(
 
 if user_input:
     process_message(user_input)
+    st.rerun()
 
 
 # -------------------- VOICE INPUT --------------------
 
 st.markdown("## 🎤 Voice Input")
 st.caption(
-    "Click the recorder, speak your complete question, then stop the recording. "
-    "The app will automatically transcribe it and answer in text."
+    "Record your question using your device's microphone. "
+    "When you finish, the recording will be transcribed and sent to the assistant."
 )
 
-# Browser-side recording avoids server microphone/PyAudio problems on Streamlit Cloud.
+# st.audio_input records in the user's browser, so Streamlit Cloud does not
+# need access to a server-side microphone or PyAudio.
 audio_recording = st.audio_input("🎙️ Record your question", key="voice_recording")
 
 if audio_recording is not None:
     audio_bytes = audio_recording.getvalue()
     audio_digest = hashlib.sha256(audio_bytes).hexdigest()
-    last_attempted_digest = st.session_state.get("last_attempted_audio_digest")
+    last_audio_digest = st.session_state.get("last_processed_audio_digest")
 
-    # st.audio_input causes reruns; the digest ensures a recording is handled once.
-    if audio_bytes and audio_digest != last_attempted_digest:
-        # Set before network calls to prevent duplicate submissions during reruns.
-        st.session_state.last_attempted_audio_digest = audio_digest
+    # Streamlit reruns the script after widget changes. Avoid submitting the
+    # same recording to the assistant more than once.
+    if audio_digest and audio_digest != last_audio_digest:
+        st.audio(audio_bytes, format="audio/wav")
 
-        try:
-            api_key = st.secrets.get("GROQ_API_KEY", "")
-            if not api_key:
-                st.error(
-                    "GROQ_API_KEY is missing. Add it under Streamlit Cloud → "
-                    "App settings → Secrets."
-                )
-            else:
+        if st.button("Transcribe and ask", key=f"transcribe_{audio_digest[:12]}"):
+            try:
                 from groq import Groq
 
-                with st.spinner("Transcribing your recording..."):
-                    groq_client = Groq(api_key=api_key)
-                    transcription = groq_client.audio.transcriptions.create(
-                        file=("voice_question.wav", audio_bytes),
-                        model="whisper-large-v3-turbo",
-                        response_format="json",
-                    )
-                    recognized_text = str(
-                        getattr(transcription, "text", "") or ""
-                    ).strip()
-
-                if not recognized_text:
-                    st.warning(
-                        "No speech was detected. Please record your question again."
+                api_key = st.secrets.get("GROQ_API_KEY", "")
+                if not api_key:
+                    st.error(
+                        "GROQ_API_KEY is missing. Add it in Streamlit Cloud "
+                        "under App settings → Secrets."
                     )
                 else:
-                    st.success(f"Transcribed: {recognized_text}")
-                    process_message(recognized_text)
+                    with st.spinner("Transcribing your recording..."):
+                        groq_client = Groq(api_key=api_key)
+                        transcript = groq_client.audio.transcriptions.create(
+                            file=("voice_question.wav", audio_bytes),
+                            model="whisper-large-v3-turbo",
+                            response_format="text",
+                        )
+                        recognized_text = str(transcript).strip()
 
-        except Exception as exc:
-            # Do not print or expose secret values.
-            st.error(
-                "Automatic transcription failed. Check that GROQ_API_KEY is valid, "
-                "the Groq package is installed, and the transcription model is available. "
-                f"Error type: {type(exc).__name__}."
-            )
+                    if not recognized_text:
+                        st.warning(
+                            "I couldn't detect any speech. Please record your question again."
+                        )
+                    else:
+                        st.session_state.last_processed_audio_digest = audio_digest
+                        st.success(f"Heard: {recognized_text}")
+                        process_message(recognized_text)
+                        st.rerun()
+            except Exception as exc:
+                # Do not print or expose API keys or secret values.
+                st.error(
+                    "Voice transcription failed. Check that the Groq API key "
+                    "is valid and the Groq package is installed. "
+                    f"Details: {type(exc).__name__}: {exc}"
+                )
+    elif audio_digest == last_audio_digest:
+        st.caption("This recording has already been submitted. Record a new question to ask again.")
 
+
+# -------------------- STOP SPEAKING --------------------
+
+if st.button("⏹️ Stop assistant speaking", key="stop_tts"):
+    try:
+        stop_speaking()
+        st.info("Stop request sent to the speech engine.")
+    except Exception as exc:
+        st.warning(
+            f"Could not stop the spoken response: {exc}"
+        )
+
+if is_speaking():
+    st.caption("🔊 Assistant audio is playing.")
 
 
 # -------------------- FINANCIAL DASHBOARD --------------------
