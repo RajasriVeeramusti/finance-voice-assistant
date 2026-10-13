@@ -6,7 +6,7 @@ from datetime import datetime
 
 import matplotlib.pyplot as plt
 import streamlit as st
-import speech_recognition as sr
+import hashlib
 
 from agent import route_query
 from database import load_user_data
@@ -312,65 +312,63 @@ if user_input:
 # -------------------- VOICE INPUT --------------------
 
 st.markdown("## 🎤 Voice Input")
-
 st.caption(
-    "Click Speak now and say your complete question. "
-    "Pause when you finish speaking."
+    "Record your question using your device's microphone. "
+    "When you finish, the recording will be transcribed and sent to the assistant."
 )
 
-if st.button("🎙️ Speak now", key="voice_input"):
-    recognizer = sr.Recognizer()
+# st.audio_input records in the user's browser, so Streamlit Cloud does not
+# need access to a server-side microphone or PyAudio.
+audio_recording = st.audio_input("🎙️ Record your question", key="voice_recording")
 
-    try:
-        with sr.Microphone() as source:
-            status = st.empty()
-            status.info("Adjusting for background noise...")
+if audio_recording is not None:
+    audio_bytes = audio_recording.getvalue()
+    audio_digest = hashlib.sha256(audio_bytes).hexdigest()
+    last_audio_digest = st.session_state.get("last_processed_audio_digest")
 
-            recognizer.adjust_for_ambient_noise(
-                source,
-                duration=0.5,
-            )
+    # Streamlit reruns the script after widget changes. Avoid submitting the
+    # same recording to the assistant more than once.
+    if audio_digest and audio_digest != last_audio_digest:
+        st.audio(audio_bytes, format="audio/wav")
 
-            status.info(
-                "Listening... Speak your question and pause when finished."
-            )
+        if st.button("Transcribe and ask", key=f"transcribe_{audio_digest[:12]}"):
+            try:
+                from groq import Groq
 
-            # No fixed phrase time limit.
-            audio = recognizer.listen(source)
+                api_key = st.secrets.get("GROQ_API_KEY", "")
+                if not api_key:
+                    st.error(
+                        "GROQ_API_KEY is missing. Add it in Streamlit Cloud "
+                        "under App settings → Secrets."
+                    )
+                else:
+                    with st.spinner("Transcribing your recording..."):
+                        groq_client = Groq(api_key=api_key)
+                        transcript = groq_client.audio.transcriptions.create(
+                            file=("voice_question.wav", audio_bytes),
+                            model="whisper-large-v3-turbo",
+                            response_format="text",
+                        )
+                        recognized_text = str(transcript).strip()
 
-            status.info("Transcribing speech...")
-            recognized_text = recognizer.recognize_google(audio)
-
-            st.success(f"Heard: {recognized_text}")
-
-            process_message(recognized_text)
-            st.rerun()
-
-    except sr.WaitTimeoutError:
-        st.warning(
-            "No speech detected. Click Speak now and try again."
-        )
-
-    except sr.UnknownValueError:
-        st.warning(
-            "I couldn't understand the recording. "
-            "Please speak clearly and try again."
-        )
-
-    except sr.RequestError as exc:
-        st.error(
-            f"Speech recognition service failed: {exc}. "
-            "Check your internet connection."
-        )
-
-    except (OSError, AttributeError) as exc:
-        st.error(
-            f"Could not start the microphone: {exc}. "
-            "Check microphone permissions and PyAudio installation."
-        )
-
-    except Exception as exc:
-        st.error(f"Voice input failed: {exc}")
+                    if not recognized_text:
+                        st.warning(
+                            "I couldn't detect any speech. Please record your question again."
+                        )
+                    else:
+                        st.session_state.last_processed_audio_digest = audio_digest
+                        st.success(f"Heard: {recognized_text}")
+                        process_message(recognized_text)
+                        st.rerun()
+            except Exception as exc:
+                # Do not print or expose API keys or secret values.
+                st.error(
+                    "Voice transcription failed. Check that the Groq API key "
+                    "is valid and the Groq package is installed. "
+                    f"Details: {type(exc).__name__}: {exc}"
+                )
+    elif audio_digest == last_audio_digest:
+        st.caption("This recording has already been submitted. Record a new question to ask again.")
 
 
 # -------------------- STOP SPEAKING --------------------
