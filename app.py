@@ -10,7 +10,7 @@ import hashlib
 
 from agent import route_query
 from database import load_user_data
-from voice import speak, stop_speaking, is_speaking
+import streamlit.components.v1 as components
 
 
 # -------------------- PAGE CONFIGURATION --------------------
@@ -231,6 +231,48 @@ for message in active_chat["messages"]:
         st.markdown(message["content"])
 
 
+# -------------------- BROWSER SPEECH OUTPUT --------------------
+
+def render_browser_speech_controls(answer, auto_speak=True):
+    """Speak in the user's browser and provide a working Stop Speaking button."""
+    safe_answer = json.dumps(str(answer)).replace("<", "\\u003c")
+    auto_speak_js = "true" if auto_speak else "false"
+    html = f"""
+    <div style="font-family:sans-serif;display:flex;align-items:center;gap:10px;">
+      <button id="stop-speech"
+        style="border:1px solid #555;border-radius:8px;padding:9px 13px;
+               background:#20232b;color:white;cursor:pointer;">
+        ⏹️ Stop speaking
+      </button>
+      <span id="speech-status" style="color:#999;font-size:13px;"></span>
+    </div>
+    <script>
+      const answerText = {safe_answer};
+      const shouldSpeak = {auto_speak_js};
+      const status = document.getElementById("speech-status");
+      function stopSpeech() {{
+        window.speechSynthesis.cancel();
+        status.textContent = "Speech stopped.";
+      }}
+      document.getElementById("stop-speech").addEventListener("click", stopSpeech);
+      if (shouldSpeak && answerText && "speechSynthesis" in window) {{
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(answerText);
+        utterance.lang = "en-IN";
+        utterance.onstart = () => status.textContent = "Speaking answer…";
+        utterance.onend = () => status.textContent = "Finished speaking.";
+        utterance.onerror = () => status.textContent = "Browser speech is unavailable.";
+        window.speechSynthesis.speak(utterance);
+      }} else if (!("speechSynthesis" in window)) {{
+        status.textContent = "Speech output is not supported by this browser.";
+      }} else {{
+        status.textContent = "Spoken answers are turned off.";
+      }}
+    </script>
+    """
+    components.html(html, height=54, scrolling=False)
+
+
 # -------------------- MESSAGE PROCESSING --------------------
 
 def process_message(user_text):
@@ -243,11 +285,13 @@ def process_message(user_text):
     chat_id = st.session_state.active_chat_id
     chat = st.session_state.chat_sessions[chat_id]
 
-    # Add the user message exactly once.
+    # Add the user message exactly once and display it in this run.
     chat["messages"].append({
         "role": "user",
         "content": user_text,
     })
+    with st.chat_message("user", avatar="👤"):
+        st.markdown(user_text)
 
     # Use the first user message as the chat title.
     if chat["title"] == "New chat":
@@ -284,12 +328,11 @@ def process_message(user_text):
 
     save_sessions()
 
-    # Speak the answer if the option is enabled.
-    if st.session_state.get("speak_answers", True):
-        try:
-            speak(answer)
-        except Exception as exc:
-            st.warning(f"Could not play the spoken answer: {exc}")
+    # Browser-based speech works on Streamlit Cloud (unlike server-side TTS).
+    render_browser_speech_controls(
+        answer,
+        auto_speak=st.session_state.get("speak_answers", True),
+    )
 
 
 # -------------------- TEXT INPUT --------------------
@@ -306,84 +349,68 @@ user_input = st.chat_input(
 
 if user_input:
     process_message(user_input)
-    st.rerun()
 
 
 # -------------------- VOICE INPUT --------------------
 
 st.markdown("## 🎤 Voice Input")
 st.caption(
-    "Record your question using your device's microphone. "
-    "When you finish, the recording will be transcribed and sent to the assistant."
+    "Click the recorder, speak your complete question, then stop the recording. "
+    "The app will automatically transcribe it and answer in text."
 )
 
-# st.audio_input records in the user's browser, so Streamlit Cloud does not
-# need access to a server-side microphone or PyAudio.
+# Browser-side recording avoids server microphone/PyAudio problems on Streamlit Cloud.
 audio_recording = st.audio_input("🎙️ Record your question", key="voice_recording")
 
 if audio_recording is not None:
     audio_bytes = audio_recording.getvalue()
     audio_digest = hashlib.sha256(audio_bytes).hexdigest()
-    last_audio_digest = st.session_state.get("last_processed_audio_digest")
+    last_attempted_digest = st.session_state.get("last_attempted_audio_digest")
 
-    # Streamlit reruns the script after widget changes. Avoid submitting the
-    # same recording to the assistant more than once.
-    if audio_digest and audio_digest != last_audio_digest:
-        st.audio(audio_bytes, format="audio/wav")
+    # st.audio_input causes reruns; the digest ensures a recording is handled once.
+    if audio_bytes and audio_digest != last_attempted_digest:
+        # Set before network calls to prevent duplicate submissions during reruns.
+        st.session_state.last_attempted_audio_digest = audio_digest
 
-        if st.button("Transcribe and ask", key=f"transcribe_{audio_digest[:12]}"):
-            try:
+        try:
+            api_key = st.secrets.get("GROQ_API_KEY", "")
+            if not api_key:
+                st.error(
+                    "GROQ_API_KEY is missing. Add it under Streamlit Cloud → "
+                    "App settings → Secrets."
+                )
+            else:
                 from groq import Groq
 
-                api_key = st.secrets.get("GROQ_API_KEY", "")
-                if not api_key:
-                    st.error(
-                        "GROQ_API_KEY is missing. Add it in Streamlit Cloud "
-                        "under App settings → Secrets."
+                with st.spinner("Transcribing your recording..."):
+                    groq_client = Groq(api_key=api_key)
+                    transcription = groq_client.audio.transcriptions.create(
+                        file=("voice_question.wav", audio_bytes),
+                        model="whisper-large-v3-turbo",
+                        response_format="json",
+                    )
+                    recognized_text = str(
+                        getattr(transcription, "text", "") or ""
+                    ).strip()
+
+                if not recognized_text:
+                    st.warning(
+                        "No speech was detected. Please record your question again."
                     )
                 else:
-                    with st.spinner("Transcribing your recording..."):
-                        groq_client = Groq(api_key=api_key)
-                        transcript = groq_client.audio.transcriptions.create(
-                            file=("voice_question.wav", audio_bytes),
-                            model="whisper-large-v3-turbo",
-                            response_format="text",
-                        )
-                        recognized_text = str(transcript).strip()
+                    st.success(f"Transcribed: {recognized_text}")
+                    process_message(recognized_text)
 
-                    if not recognized_text:
-                        st.warning(
-                            "I couldn't detect any speech. Please record your question again."
-                        )
-                    else:
-                        st.session_state.last_processed_audio_digest = audio_digest
-                        st.success(f"Heard: {recognized_text}")
-                        process_message(recognized_text)
-                        st.rerun()
-            except Exception as exc:
-                # Do not print or expose API keys or secret values.
-                st.error(
-                    "Voice transcription failed. Check that the Groq API key "
-                    "is valid and the Groq package is installed. "
-                    f"Details: {type(exc).__name__}: {exc}"
-                )
-    elif audio_digest == last_audio_digest:
-        st.caption("This recording has already been submitted. Record a new question to ask again.")
+        except Exception as exc:
+            # Do not print or expose secret values.
+            st.error(
+                "Automatic transcription failed. Check that GROQ_API_KEY is valid, "
+                "the Groq package is installed, and the transcription model is available. "
+                f"Error type: {type(exc).__name__}."
+            )
 
-
-# -------------------- STOP SPEAKING --------------------
-
-if st.button("⏹️ Stop assistant speaking", key="stop_tts"):
-    try:
-        stop_speaking()
-        st.info("Stop request sent to the speech engine.")
-    except Exception as exc:
-        st.warning(
-            f"Could not stop the spoken response: {exc}"
-        )
-
-if is_speaking():
-    st.caption("🔊 Assistant audio is playing.")
+if not st.session_state.get("speak_answers", True):
+    st.caption("🔇 Spoken answers are turned off; answers will still appear as text.")
 
 
 # -------------------- FINANCIAL DASHBOARD --------------------
